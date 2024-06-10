@@ -19,6 +19,12 @@
 #define KERNEL_SECTOR_SIZE 512
 #define HW_SECT 4096
 
+// TODO: Why when `#define code version(KVER1, KVER2, KVER3)` compiler complains
+// about version expression, but in user space program doesn't?
+// #define NTBZ_KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))
+#define NTBZ_KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))
+#define NTBZ_LINUX_VERSION_CODE 395520
+
 static u64 nr_sect;
 
 static char *vd_name = "ntbz_raid0";
@@ -42,7 +48,12 @@ struct ntbz_bd {
 	#if (RELAY_TYPE == 0)
 	struct file *real_file;
 	#else
+	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 	struct bdev_handle *real_bdev;
+	#else
+	struct file *bdev_file;
+	struct block_device *real_bdev;
+	#endif
 	#endif
 };
 
@@ -68,7 +79,11 @@ static struct block_device_operations ntbz_block_ops = {
 #if (RELAY_TYPE == 0)
 static int init_botdev(struct ntbz_bd *dev, const char *name)
 #else
+#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 static struct bdev_handle *open_disk(const char *name)
+#else
+static int init_botdev(struct ntbz_bd *dev, const char *path)
+#endif
 #endif
 {
 	pr_info("ntbz: stackable/relay: getting block device file\n");
@@ -81,13 +96,26 @@ static struct bdev_handle *open_disk(const char *name)
 	// dev->real_bdev = I_BDEV(dev->real_file->f_mapping->host);
 	return 0;
 	#else
-	struct bdev_handle *bdev = bdev_open_by_path(name, BLK_OPEN_READ |
-		BLK_OPEN_WRITE, NULL, NULL);
-	if (IS_ERR(bdev)) {
+	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+	struct bdev_handle *bdev_hand = bdev_open_by_path(name,
+		BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
+	if (IS_ERR(bdev_hand)) {
 		pr_err("ntbz: stackable/relay: bdev_open_by_path()\n");
 		return NULL;
 	}
-	return bdev;
+	return bdev_hand;
+	#else
+	struct file *bdev_file = bdev_file_open_by_path(path,
+		BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
+	if (IS_ERR(bdev_file)) {
+		pr_err("ntbz: stackable/relay: bdev_file_open_by_path()\n");
+		return PTR_ERR(bdev_file);
+		// return ERR_PTR(ret);
+	}
+	dev->bdev_file = bdev_file;
+	dev->real_bdev = file_bdev(bdev_file);
+	return 0;
+	#endif
 	#endif
 }
 
@@ -123,10 +151,18 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 			if (real_file)
 				kernel_write(real_file, b_buf, b_len, &sector);
 			#else
-			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1,
-				REQ_OP_WRITE, GFP_KERNEL);
-
+			bio_ptr = bio_alloc(
+			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+				dev->real_bdev->bdev,
+			#else
+				dev->real_bdev,
+			#endif
+				1, REQ_OP_WRITE, GFP_KERNEL);
+			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 			bio_ptr->bi_bdev = dev->real_bdev->bdev;
+			#else
+			bio_ptr->bi_bdev = dev->real_bdev;
+			#endif
 			bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
 			bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len,
 				bvec.bv_offset);
@@ -137,9 +173,16 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 		} else {
 			pr_info("ntbz: stackable/relay: reading\n");
 			#if (RELAY_TYPE == 1)
-			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1,
-				REQ_OP_READ, GFP_KERNEL);
+			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_READ, GFP_KERNEL);
+			#else
+			bio_ptr = bio_alloc(dev->real_bdev, 1, REQ_OP_READ, GFP_KERNEL);
+			#endif
+			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 			bio_ptr->bi_bdev = dev->real_bdev->bdev;
+			#else
+			bio_ptr->bi_bdev = dev->real_bdev;
+			#endif
 			bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
 			bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len, bvec.bv_offset);
 			pr_info("ntbz: stackable/relay: bio_add_page() = %d\n", bapret);
@@ -218,7 +261,7 @@ static int ntbz_create_blkdev(struct ntbz_bd *dev)
 		return rv;
 	}
 
-	dev->gd = blk_mq_alloc_disk(&dev->ts, dev);
+	dev->gd = blk_mq_alloc_disk(&dev->ts, NULL, dev);
 	if (dev->gd == NULL) {
 		pr_err("Error: ntbz_create_blkdev() / ntbz_mq_alloc_disk()\n");
 		return 1;
@@ -233,7 +276,11 @@ static int ntbz_create_blkdev(struct ntbz_bd *dev)
 	dev->gd->fops = &ntbz_block_ops;
 	snprintf(dev->gd->disk_name, strlen(vd_name), vd_name);
 	pr_info("ntbz: stackable/relay: Calling get_capacity()\n");
+	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 	nr_sect = get_capacity(dev->real_bdev->bdev->bd_disk);
+	#else
+	nr_sect = get_capacity(dev->real_bdev->bd_disk);
+	#endif
 	pr_info("ntbz: ntbz_create_blkdev() / nr_sect = %lld\n", nr_sect);
 	// set_capacity(dev->gd, nr_sect * (HW_SECT / KERNEL_SECTOR_SIZE));
 	set_capacity(dev->gd, nr_sect);
@@ -275,9 +322,15 @@ static int __init ntbz_init(void)
 	if (err)
 		return err;
 	#else
+	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 	ntbz_bdev.real_bdev = open_disk(pd[0]);
 	if (ntbz_bdev.real_bdev == NULL)
 		return -EINVAL;
+	#else
+	err = init_botdev(&ntbz_bdev, pd[0]);
+	if (err)
+		return err;
+	#endif
 	#endif
 
 	err = ntbz_create_blkdev(&ntbz_bdev);
@@ -310,7 +363,11 @@ static void __exit ntbz_exit(void)
 {
 	unregister_blkdev(NTBZ_MAJOR, NTBZ_NAME);
 	#if (RELAY_TYPE == 1)
+	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 	bdev_release(ntbz_bdev.real_bdev);
+	#else
+	fput(ntbz_bdev.bdev_file);
+	#endif
 	#endif
 	ntbz_delete_blkdev(&ntbz_bdev);
 }

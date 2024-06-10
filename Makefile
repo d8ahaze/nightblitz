@@ -1,9 +1,14 @@
 # To build against other version you can:
 # make lnk_linux=lnk/lib/modules/5.10.217/kernel bld_linux=bld-v5.10 install
 # in packs dir.
-lnk_linux = lnk/lib/modules/6.8.10-g35db9c10321e/kernel
 
-bld_linux = bld-v6.8
+KVER1 = 6
+KVER2 = 9
+KVER3 = 3
+
+lnk_linux = lnk/lib/modules/6.9.3/kernel
+
+bld_linux = bld-v6.9
 bld_ntbz = bld
 
 dst_linux = $(hub)/packs/linux
