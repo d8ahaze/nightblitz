@@ -2,10 +2,6 @@
 # make lnk_linux=lnk/lib/modules/5.10.217/kernel bld_linux=bld-v5.10 install
 # in packs dir.
 
-KVER1 = 6
-KVER2 = 9
-KVER3 = 3
-
 lnk_linux = lnk/lib/modules/6.9.3/kernel
 
 bld_linux = bld-v6.9

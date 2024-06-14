@@ -19,11 +19,8 @@
 #define KERNEL_SECTOR_SIZE 512
 #define HW_SECT 4096
 
-// TODO: Why when `#define code version(KVER1, KVER2, KVER3)` compiler complains
-// about version expression, but in user space program doesn't?
-// #define NTBZ_KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))
-#define NTBZ_KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))
-#define NTBZ_LINUX_VERSION_CODE 395520
+#define NTBZ_KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))
+#define NTBZ_LINUX_VERSION_CODE NTBZ_KERNEL_VERSION(KVER1, KVER2, KVER3)
 
 static u64 nr_sect;
 
