@@ -27,13 +27,31 @@ static u64 nr_sect;
 static char *vd_name = "ntbz_raid0";
 module_param(vd_name, charp, S_IRUGO);
 
-// physical drive
-static char *pd[1];
+#define DRIVES_NUM 4
+static int drives_num = 2;
+module_param(drives_num, int, 0);
+
+// TODO: how to allocate dynamically params?
+// array of physical drives pathnames
+static char *pd[DRIVES_NUM];
 module_param_array(pd, charp, NULL, 0);
 
 // 0: kernel_read/write
 // 1: bio, memcpy
-#define RELAY_TYPE 1
+#define SERVE_TYPE 1
+
+struct botdev {
+	#if (SERVE_TYPE == 0)
+		struct file *real_file;
+	#else
+		#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+		struct bdev_handle *real_bdev;
+		#else
+		struct file *bdev_file;
+		struct block_device *real_bdev;
+		#endif
+	#endif
+};
 
 struct ntbz_bd {
 	struct gendisk *gd;
@@ -42,16 +60,7 @@ struct ntbz_bd {
 	bool added;
 	u8 *data;
 	sector_t ss;	// size in sectors
-	#if (RELAY_TYPE == 0)
-	struct file *real_file;
-	#else
-	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-	struct bdev_handle *real_bdev;
-	#else
-	struct file *bdev_file;
-	struct block_device *real_bdev;
-	#endif
-	#endif
+	struct botdev *botdevs;
 };
 
 static struct ntbz_bd ntbz_bdev;
@@ -73,18 +82,18 @@ static struct block_device_operations ntbz_block_ops = {
 	.release = ntbz_release
 };
 
-#if (RELAY_TYPE == 0)
+#if (SERVE_TYPE == 0)
 static int init_botdev(struct ntbz_bd *dev, const char *name)
 #else
 #if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 static struct bdev_handle *open_disk(const char *name)
 #else
-static int init_botdev(struct ntbz_bd *dev, const char *path)
+static int init_botdev(struct botdev *btdv, const char *path)
 #endif
 #endif
 {
 	pr_info("ntbz: stackable/relay: getting block device file\n");
-	#if (RELAY_TYPE == 0)
+	#if (SERVE_TYPE == 0)
 	dev->real_file = filp_open(name, O_RDWR | O_SYNC, 0);
 	if (IS_ERR(dev->real_file)) {
 		pr_err("ntbz: stackable/relay: failed to open %s\n", name);
@@ -109,8 +118,8 @@ static int init_botdev(struct ntbz_bd *dev, const char *path)
 		return PTR_ERR(bdev_file);
 		// return ERR_PTR(ret);
 	}
-	dev->bdev_file = bdev_file;
-	dev->real_bdev = file_bdev(bdev_file);
+	btdv->bdev_file = bdev_file;
+	btdv->real_bdev = file_bdev(bdev_file);
 	return 0;
 	#endif
 	#endif
@@ -123,7 +132,7 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 
 	struct bio_vec bvec;
 	struct req_iterator iter;
-	#if (RELAY_TYPE == 0)
+	#if (SERVE_TYPE == 0)
 	struct file *real_file = dev->real_file;
 	#else
 	struct bio *bio_ptr;
@@ -131,6 +140,9 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 
 	sector_t sector = blk_rq_pos(req);
 	pr_info("ntbz: ntbz_transfer_bio(): sector = %lld\n", sector);
+
+	int idx;
+	size_t stripe_size = 4 * 1024;
 
 	rq_for_each_segment(bvec, req, iter) {
 		unsigned long b_len = bvec.bv_len;
@@ -141,24 +153,23 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 			return 1;
 
 		int bapret;
+		idx = (sector / stripe_size) % drives_num;
 		if (rq_data_dir(req) == REQ_OP_WRITE) {
 			pr_info("ntbz: stackable/relay: writing\n");
 			memcpy(dev->data + sector, b_buf, b_len);
-			#if (RELAY_TYPE == 0)
+			#if (SERVE_TYPE == 0)
 			if (real_file)
 				kernel_write(real_file, b_buf, b_len, &sector);
 			#else
-			bio_ptr = bio_alloc(
 			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-				dev->real_bdev->bdev,
+			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
 			#else
-				dev->real_bdev,
+			bio_ptr = bio_alloc(dev->botdevs[idx].real_bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
 			#endif
-				1, REQ_OP_WRITE, GFP_KERNEL);
 			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 			bio_ptr->bi_bdev = dev->real_bdev->bdev;
 			#else
-			bio_ptr->bi_bdev = dev->real_bdev;
+			bio_ptr->bi_bdev = dev->botdevs[idx].real_bdev;
 			#endif
 			bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
 			bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len,
@@ -169,16 +180,16 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 			#endif
 		} else {
 			pr_info("ntbz: stackable/relay: reading\n");
-			#if (RELAY_TYPE == 1)
+			#if (SERVE_TYPE == 1)
 			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_READ, GFP_KERNEL);
 			#else
-			bio_ptr = bio_alloc(dev->real_bdev, 1, REQ_OP_READ, GFP_KERNEL);
+			bio_ptr = bio_alloc(dev->botdevs[idx].real_bdev, 1, REQ_OP_READ, GFP_KERNEL);
 			#endif
 			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 			bio_ptr->bi_bdev = dev->real_bdev->bdev;
 			#else
-			bio_ptr->bi_bdev = dev->real_bdev;
+			bio_ptr->bi_bdev = dev->botdevs[idx].real_bdev;
 			#endif
 			bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
 			bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len, bvec.bv_offset);
@@ -187,7 +198,7 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 			bio_put(bio_ptr);
 			#endif
 			memcpy(b_buf, dev->data + sector, b_len);
-			#if (RELAY_TYPE == 0)
+			#if (SERVE_TYPE == 0)
 			if (real_file)
 				kernel_read(real_file, b_buf, b_len, &sector);
 			#endif
@@ -276,7 +287,10 @@ static int ntbz_create_blkdev(struct ntbz_bd *dev)
 	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
 	nr_sect = get_capacity(dev->real_bdev->bdev->bd_disk);
 	#else
-	nr_sect = get_capacity(dev->real_bdev->bd_disk);
+	nr_sect = 0;
+	for (int i = 0; i < drives_num; ++i) {
+		nr_sect += get_capacity(dev->botdevs[i].real_bdev->bd_disk);
+	}
 	#endif
 	pr_info("ntbz: ntbz_create_blkdev() / nr_sect = %lld\n", nr_sect);
 	// set_capacity(dev->gd, nr_sect * (HW_SECT / KERNEL_SECTOR_SIZE));
@@ -285,6 +299,7 @@ static int ntbz_create_blkdev(struct ntbz_bd *dev)
 	dev->gd->private_data = dev;
 
 	pr_info("ntbz: stackable/relay: Allocating virtual block device\n");
+	// TODO: yes.
 	// dev->data = vmalloc(nr_sect * KERNEL_SECTOR_SIZE);
 	dev->data = kmalloc(123 * KERNEL_SECTOR_SIZE, GFP_KERNEL);
 
@@ -314,7 +329,7 @@ static int __init ntbz_init(void)
 	}
 	pr_info("ntbz: device is registered\n");
 
-	#if (RELAY_TYPE == 0)
+	#if (SERVE_TYPE == 0)
 	err = init_botdev(&ntbz_bdev, pd[0]);
 	if (err)
 		return err;
@@ -324,9 +339,12 @@ static int __init ntbz_init(void)
 	if (ntbz_bdev.real_bdev == NULL)
 		return -EINVAL;
 	#else
-	err = init_botdev(&ntbz_bdev, pd[0]);
-	if (err)
-		return err;
+	ntbz_bdev.botdevs = kmalloc(sizeof(struct botdev) * drives_num, GFP_KERNEL);
+	for (int i = 0; i < drives_num; ++i) {
+		err = init_botdev(ntbz_bdev.botdevs + i, pd[i]);
+		if (err)
+			return err;
+	}
 	#endif
 	#endif
 
@@ -354,18 +372,24 @@ static void ntbz_delete_blkdev(struct ntbz_bd *dev)
 
 	if (dev->data)
 		kfree(dev->data);
+
+	#if (SERVE_TYPE == 1)
+	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+	bdev_release(ntbz_bdev.real_bdev);
+	#else
+	for (int i = 0; i < drives_num; ++i) {
+		fput(dev->botdevs[i].bdev_file);
+	}
+	#endif
+	#endif
+
+	if (dev->botdevs)
+		kfree(dev->botdevs);
 }
 
 static void __exit ntbz_exit(void)
 {
 	unregister_blkdev(NTBZ_MAJOR, NTBZ_NAME);
-	#if (RELAY_TYPE == 1)
-	#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-	bdev_release(ntbz_bdev.real_bdev);
-	#else
-	fput(ntbz_bdev.bdev_file);
-	#endif
-	#endif
 	ntbz_delete_blkdev(&ntbz_bdev);
 }
 
