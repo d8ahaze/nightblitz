@@ -36,6 +36,10 @@ module_param(drives_num, int, 0);
 static char *pd[DRIVES_NUM];
 module_param_array(pd, charp, NULL, 0);
 
+// RAID level
+static int rlvl = 0;
+module_param(rlvl, int, 0);
+
 // 0: kernel_read/write
 // 1: bio, memcpy
 #define SERVE_TYPE 1
@@ -157,46 +161,58 @@ static int serve_request(struct ntbz_bd *dev, struct request *req, u32 *nrb)
 		if (rq_data_dir(req) == REQ_OP_WRITE) {
 			pr_info("ntbz: stackable/relay: writing\n");
 			memcpy(dev->data + sector, b_buf, b_len);
-			#if (SERVE_TYPE == 0)
-			if (real_file)
-				kernel_write(real_file, b_buf, b_len, &sector);
-			#else
-			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
-			#else
-			bio_ptr = bio_alloc(dev->botdevs[idx].real_bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
-			#endif
-			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-			bio_ptr->bi_bdev = dev->real_bdev->bdev;
-			#else
-			bio_ptr->bi_bdev = dev->botdevs[idx].real_bdev;
-			#endif
-			bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
-			bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len,
-				bvec.bv_offset);
-			pr_info("ntbz: stackable/relay: bio_add_page() = %d\n", bapret);
-			submit_bio_wait(bio_ptr);
-			bio_put(bio_ptr);
-			#endif
+			for (int i = 0; i < drives_num; ++i) {
+				if (rlvl == 1)
+					idx = i;
+				#if (SERVE_TYPE == 0)
+				if (real_file)
+					kernel_write(real_file, b_buf, b_len, &sector);
+				#else	// SERVE_TYPE == 1
+				#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+				bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
+				#else
+				bio_ptr = bio_alloc(dev->botdevs[idx].real_bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
+				#endif
+				#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+				bio_ptr->bi_bdev = dev->real_bdev->bdev;
+				#else
+				bio_ptr->bi_bdev = dev->botdevs[idx].real_bdev;
+				#endif
+				bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
+				bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len,
+					bvec.bv_offset);
+				pr_info("ntbz: stackable/relay: bio_add_page() = %d\n", bapret);
+				submit_bio_wait(bio_ptr);
+				bio_put(bio_ptr);
+				#endif	// SERVE_TYPE
+				if (rlvl == 0)
+					break;
+			}
 		} else {
 			pr_info("ntbz: stackable/relay: reading\n");
 			#if (SERVE_TYPE == 1)
-			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-			bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_READ, GFP_KERNEL);
-			#else
-			bio_ptr = bio_alloc(dev->botdevs[idx].real_bdev, 1, REQ_OP_READ, GFP_KERNEL);
-			#endif
-			#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
-			bio_ptr->bi_bdev = dev->real_bdev->bdev;
-			#else
-			bio_ptr->bi_bdev = dev->botdevs[idx].real_bdev;
-			#endif
-			bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
-			bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len, bvec.bv_offset);
-			pr_info("ntbz: stackable/relay: bio_add_page() = %d\n", bapret);
-			submit_bio_wait(bio_ptr);
-			bio_put(bio_ptr);
-			#endif
+			for (int i = 0; i < drives_num; ++i) {
+				if (rlvl == 1)
+					idx = i;
+				#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+				bio_ptr = bio_alloc(dev->real_bdev->bdev, 1, REQ_OP_READ, GFP_KERNEL);
+				#else
+				bio_ptr = bio_alloc(dev->botdevs[idx].real_bdev, 1, REQ_OP_READ, GFP_KERNEL);
+				#endif
+				#if (NTBZ_LINUX_VERSION_CODE < NTBZ_KERNEL_VERSION(6, 9, 0))
+				bio_ptr->bi_bdev = dev->real_bdev->bdev;
+				#else
+				bio_ptr->bi_bdev = dev->botdevs[idx].real_bdev;
+				#endif
+				bio_ptr->bi_iter.bi_sector = blk_rq_pos(req);
+				bapret = bio_add_page(bio_ptr, bvec.bv_page, b_len, bvec.bv_offset);
+				pr_info("ntbz: stackable/relay: bio_add_page() = %d\n", bapret);
+				submit_bio_wait(bio_ptr);
+				bio_put(bio_ptr);
+				if (rlvl == 0)
+					break;
+			}
+			#endif	// SERVE_TYPE
 			memcpy(b_buf, dev->data + sector, b_len);
 			#if (SERVE_TYPE == 0)
 			if (real_file)
